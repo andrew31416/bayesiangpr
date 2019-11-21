@@ -19,13 +19,17 @@ class GPR():
     parameters.
     """
 
-    def __init__(self,Nsample=100,maxiter=100,lr=1e-3,decay_rate=1e-2):
+    def __init__(self,Nsample=100,maxiter=100,lr=1e-4,decay_rate=1e-2,alpha=1e-2):
         _ = [getattr(self,"set_{}".format(_k))({"Nsample":Nsample,\
-                "maxiter":maxiter,"lr":lr,"decayrate":decay_rate}[_k]) \
-                for _k in ["Nsample","maxiter","lr","decayrate"]]
+                "maxiter":maxiter,"lr":lr,"decayrate":decay_rate,"alpha":alpha}[_k]) \
+                for _k in ["Nsample","maxiter","lr","decayrate","alpha"]]
 
         # precision
         self.dtype = np.float64
+
+    def set_alpha(self,alpha):
+        if alpha<0.0: raise Exception("alpha must be positive")
+        self.alpha = alpha
 
     def set_decayrate(self,decay_rate):
         self.decay_rate = decay_rate
@@ -197,7 +201,7 @@ class GPR():
         # exp. kernel with diagonal correction 
         self.covariance = self.hyperparam[0]**2 \
                 * np.exp(-0.5*self.l2_norm/(self.hyperparam[1]**2)) \
-                + np.eye(self.N)*self.hyperparam[2]**2 + np.eye(self.N)*1e-2
+                + np.eye(self.N)*self.hyperparam[2]**2 + np.eye(self.N)*self.alpha
 
         # psuedo-inv. if necessary
         self.covariance_inverse = np.linalg.inv(self.covariance)
@@ -397,26 +401,70 @@ class GPR():
     def covariance_matrix_derivative__diagonal(self):
         return 2.0*self.hyperparam[2]*np.eye(self.N)
 
-    def predict(self,X):
+    def predict(self,X,sample_posterior="mode"):
         """
         Use mode of latent variable distribution parameters to make point
         estimate.
         """
-        # update covariance, inv covartiance to mode of lv. distributions
-        self.update_all_sampled_dependent_variables(epsilon=np.zeros(3))
+        if sample_posterior not in ["mode","full"]: 
+            raise Exception("Unexpected argument for sample_posterior")
 
-        # [Ntest,Ntrain] kernels
-        K = np.asarray([np.sum(np.square(np.tile(_x,(self.N,1))-self.X),axis=1) \
+        # number of samples of posterior distribution
+        Nsample = 500
+
+        
+        # [Ntest,Ntrain] tensor of l2-norms
+        l2norm = np.asarray([np.sum(np.square(np.tile(_x,(self.N,1))-self.X),axis=1) \
                 for _x in X])
-        K = self.hyperparam[0]**2 * np.exp(-0.5*K/self.hyperparam[1]**2) 
+        
+        #---------------------------------------------------#
+        # calculate expected value - analytically tractable #
+        #---------------------------------------------------#
+
+        # update covariance, inv covartiance to mode of lv. distributions
+        self.update_all_sampled_dependent_variables(epsilon=np.zeros(3,dtype=np.float64))
+        
+        # k(x,x)
+        k0 = self.alpha + self.hyperparam[0]**2 + self.hyperparam[2]**2
+        
+        K = self.hyperparam[0]**2 * np.exp(-0.5*l2norm/self.hyperparam[1]**2) 
 
         # [Ntest,] array of expected values
         mean = np.einsum("ab,bc,c->a",K,self.covariance_inverse,self.t) 
+        
+        if sample_posterior == "mode":
+            # second moment is analytically tractable
+            std = np.sqrt(k0 - np.asarray([np.dot(_k.T,\
+                    np.dot(self.covariance_inverse,_k)) for _k in K]))
+        else:
+            # [Nsamples][Ntest]
+            mean_samples,samples = [[] for jj in range(2)]
+            
+            for ss in range(Nsample):
+                try:
+                    # since drawning hyperparams is stochastic, is possible a non-PSD
+                    # covariance may be drawn
 
-        # k(x,x)
-        k0 = self.hyperparam[0]**2 + self.hyperparam[2]**2
+                    epsilon = np.random.normal(loc=0,scale=1,size=3)
 
-        std = np.sqrt(k0 - np.asarray([np.dot(_k.T,\
-                np.dot(self.covariance_inverse,_k)) for _k in K]))
+                    # update covariance, inv covartiance to mode of lv. distributions
+                    self.update_all_sampled_dependent_variables(epsilon=epsilon)
 
+                    K = self.hyperparam[0]**2 * np.exp(-0.5*l2norm/self.hyperparam[1]**2) 
+
+                    # [Ntest,] array of expected values
+                    mean_samples.append(np.einsum("ab,bc,c->a",K,self.covariance_inverse,self.t))
+
+                    std_samples = np.sqrt(k0 - np.asarray([np.dot(_k.T,\
+                            np.dot(self.covariance_inverse,_k)) for _k in K]))
+
+                    # draw sample from Gaussian posterior predictive dist. for each data point
+                    samples.append([np.random.normal(loc=mean_samples[ss][ii],\
+                            scale=std_samples[ii],size=1) for ii in range(len(K))])
+                except ValueError:
+                    continue
+            samples = np.asarray(samples)
+        
+            # second moment not analytically tractable
+            std = np.std(samples,axis=0).flatten()
         return mean,std
